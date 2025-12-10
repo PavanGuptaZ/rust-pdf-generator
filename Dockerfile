@@ -1,7 +1,6 @@
 # --- Stage 1: Builder ---
 FROM rust:1.83-slim-bookworm AS builder
 
-# Install build deps for reqwest/openssl
 RUN apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \
@@ -14,7 +13,6 @@ RUN cargo build --release
 # --- Stage 2: Runtime ---
 FROM debian:bookworm-slim
 
-# Install Chromium + Fonts (Chinese, Japanese, Emoji)
 RUN apt-get update && apt-get install -y \
     chromium \
     curl \
@@ -27,7 +25,7 @@ RUN apt-get update && apt-get install -y \
 COPY --from=builder /app/target/release/rust-pdf-gen /usr/local/bin/app
 COPY entrypoint.sh /entrypoint.sh
 
-RUN chmod +x /entrypoint.sh
+RUN sed -i 's/\r$//' /entrypoint.sh && chmod +x /entrypoint.sh
 
 RUN useradd -m appuser
 USER appuser
@@ -35,4 +33,5 @@ USER appuser
 ENV PORT=3000
 EXPOSE 3000
 
+# Use bash explicitly
 ENTRYPOINT ["/entrypoint.sh"]

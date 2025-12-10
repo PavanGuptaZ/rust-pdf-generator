@@ -1,6 +1,7 @@
 #!/bin/bash
 
 echo "🚀 Starting Chromium..."
+
 chromium \
   --headless=new \
   --no-sandbox \
@@ -13,6 +14,8 @@ chromium \
   --disable-breakpad \
   --no-first-run \
   --mute-audio \
+  --disable-features=Vulkan \
+  --disable-gl-drawing-for-tests \
   &
 
 echo "⏳ Waiting for Chromium..."

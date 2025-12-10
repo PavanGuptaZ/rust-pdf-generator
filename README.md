@@ -24,3 +24,46 @@ A high-performance PDF generation service built with Rust using the Chrome DevTo
 git clone <repository-url>
 cd rust-pdf-gen
 ```
+
+2. Build the project:
+
+```bash
+cargo build --release
+```
+
+3. Run the server:
+
+```bash
+cargo run --release
+```
+
+## Usage
+
+To generate a PDF, send a POST request to the `/generate` endpoint with the following JSON payload:
+
+```json
+{
+  "html": "<h1>Hello, World!</h1>",
+  "landscape": false
+}
+```
+
+The `html` field is required and should contain the HTML content to be converted to PDF. The `landscape` field is optional and defaults to `false`. If set to `true`, the PDF will be generated in landscape orientation.
+
+## Deployment
+
+### Docker
+
+To deploy the service using Docker, follow these steps:
+
+1. Build the Docker image:
+
+```bash
+docker build -t rust-pdf-gen .
+```
+
+2. Run the Docker container:
+
+```bash
+docker run --rm -p 3000:3000 rust-pdf-gen
+```
