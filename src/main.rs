@@ -1,78 +1,125 @@
 use axum::{
-    extract::{DefaultBodyLimit},
+    extract::{DefaultBodyLimit, State},
     http::{HeaderMap, header},
-    response::{IntoResponse},
+    response::IntoResponse,
     routing::{post, get},
     Json, Router,
 };
+use futures_util::{SinkExt, StreamExt};
+use reqwest::Client as HttpClient;
 use serde::Deserialize;
-use std::process::Command;
-use std::fs;
-use uuid::Uuid;
+use serde_json::{json, Value};
+use std::sync::Arc;
+use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
 #[derive(Deserialize)]
 struct PdfRequest {
     html: String,
+    #[serde(default)]
+    landscape: bool,
+}
+
+struct AppState {
+    http: HttpClient,
 }
 
 #[tokio::main]
 async fn main() {
+    let state = Arc::new(AppState {
+        http: HttpClient::new(),
+    });
+
     let app = Router::new()
         .route("/health", get(|| async { "OK" }))
         .route("/generate", post(generate_pdf))
-        .layer(DefaultBodyLimit::max(10 * 1024 * 1024));
+        .layer(DefaultBodyLimit::max(10 * 1024 * 1024))
+        .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
-    println!("🚀 Server running on http://0.0.0.0:3000");
+    println!("🚀 High-Perf Server running on http://0.0.0.0:3000");
     axum::serve(listener, app).await.unwrap();
 }
 
-async fn generate_pdf(Json(payload): Json<PdfRequest>) -> impl IntoResponse {
-    let file_id = Uuid::new_v4();
-    let input_path = format!("/tmp/{}.html", file_id);
-    let output_path = format!("/tmp/{}.pdf", file_id);
+async fn generate_pdf(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<PdfRequest>,
+) -> Result<impl IntoResponse, String> {
+    let new_tab_url = "http://127.0.0.1:9222/json/new";
+    let tab_info: Value = state.http.put(new_tab_url).send().await
+        .map_err(|e| format!("Chrome not reachable: {}", e))?
+        .json().await
+        .map_err(|e| format!("Failed to parse tab info: {}", e))?;
 
-    // 1. Write HTML to file
-    if let Err(_) = fs::write(&input_path, &payload.html) {
-        return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Failed to write HTML").into_response();
-    }
+    let ws_url = tab_info["webSocketDebuggerUrl"].as_str()
+        .ok_or("No WebSocket URL found")?;
+    let tab_id = tab_info["id"].as_str()
+        .ok_or("No Tab ID found")?;
 
-    // 2. Run Chromium CLI
-    // --headless=new is the modern headless mode
-    let status = Command::new("chromium")
-        .args(&[
-            "--headless=new",
-            "--disable-gpu",
-            "--no-pdf-header-footer",
-            "--print-to-pdf-no-header",
-            &format!("--print-to-pdf={}", output_path),
-            &input_path
-        ])
-        .status();
+    let (ws_stream, _) = connect_async(ws_url).await
+        .map_err(|e| format!("WS Connect failed: {}", e))?;
+    let (mut write, mut read) = ws_stream.split();
 
-    // 3. Check if command succeeded
-    match status {
-        Ok(s) if s.success() => {
-            // Read the generated PDF
-            match fs::read(&output_path) {
-                Ok(pdf_bytes) => {
-                    // Cleanup
-                    let _ = fs::remove_file(input_path);
-                    let _ = fs::remove_file(output_path);
+    let mut command_id = 0;
+    
+    command_id += 1;
+    let set_content_cmd = json!({
+        "id": command_id,
+        "method": "Page.setDocumentContent",
+        "params": {
+            "frameId": tab_id,
+            "html": payload.html
+        }
+    });
+    write.send(Message::Text(set_content_cmd.to_string())).await.map_err(|e| e.to_string())?;
 
-                    let mut headers = HeaderMap::new();
-                    headers.insert(header::CONTENT_TYPE, "application/pdf".parse().unwrap());
-                    headers.insert(header::CONTENT_DISPOSITION, "attachment; filename=\"output.pdf\"".parse().unwrap());
-                    
-                    (headers, pdf_bytes).into_response()
-                },
-                Err(_) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Failed to read PDF").into_response()
-            }
-        },
-        _ => {
-            // Cleanup
-            let _ = fs::remove_file(input_path);
-            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Chromium failed to generate PDF").into_response()
+    while let Some(msg) = read.next().await {
+        if let Ok(Message::Text(text)) = msg {
+            if text.contains(&format!("\"id\":{}", command_id)) { break; }
         }
     }
+
+    command_id += 1;
+    let print_cmd = json!({
+        "id": command_id,
+        "method": "Page.printToPDF",
+        "params": {
+            "landscape": payload.landscape,
+            "printBackground": true,
+            "paperWidth": 8.27,
+            "paperHeight": 11.7,
+            "marginTop": 0.0,
+            "marginBottom": 0.0,
+            "marginLeft": 0.0,
+            "marginRight": 0.0
+        }
+    });
+    write.send(Message::Text(print_cmd.to_string())).await.map_err(|e| e.to_string())?;
+
+    let mut pdf_base64 = String::new();
+    while let Some(msg) = read.next().await {
+        if let Ok(Message::Text(text)) = msg {
+            if text.contains(&format!("\"id\":{}", command_id)) {
+                let v: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+                if let Some(data) = v["result"]["data"].as_str() {
+                    pdf_base64 = data.to_string();
+                }
+                break;
+            }
+        }
+    }
+
+    let close_url = format!("http://127.0.0.1:9222/json/close/{}", tab_id);
+    let _ = state.http.get(&close_url).send().await;
+
+    if pdf_base64.is_empty() {
+        return Err("PDF generation failed (empty response)".to_string());
+    }
+
+    let pdf_bytes = base64::decode(&pdf_base64).map_err(|e| e.to_string())?;
+
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CONTENT_TYPE, "application/pdf".parse().unwrap());
+    headers.insert(header::CONTENT_DISPOSITION, "attachment; filename=\"output.pdf\"".parse().unwrap());
+
+    Ok((headers, pdf_bytes))
 }
