@@ -1,7 +1,7 @@
 # --- Stage 1: Builder ---
 FROM rust:1.83-slim-bookworm AS builder
 
-# FIX: Install OpenSSL and pkg-config (Required for compiling reqwest/tungstenite)
+# Install build deps for reqwest/openssl
 RUN apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \
@@ -9,18 +9,18 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 COPY . .
-
-# Now this will succeed because pkg-config is found
 RUN cargo build --release
 
 # --- Stage 2: Runtime ---
 FROM debian:bookworm-slim
 
-# Install Chromium and curl (for health check)
+# Install Chromium + Fonts (Chinese, Japanese, Emoji)
 RUN apt-get update && apt-get install -y \
     chromium \
     curl \
     fonts-liberation \
+    fonts-noto-cjk \
+    fonts-noto-color-emoji \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
@@ -29,7 +29,6 @@ COPY entrypoint.sh /entrypoint.sh
 
 RUN chmod +x /entrypoint.sh
 
-# Create non-root user
 RUN useradd -m appuser
 USER appuser
 
